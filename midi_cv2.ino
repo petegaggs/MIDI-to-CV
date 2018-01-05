@@ -10,8 +10,7 @@
   MIDI to CV converter
   control voltage provided by MCP4821 SPI DAC  
   uses Arduino MIDI library
-  this one uses the proper note off function, longer delay before turning on the gate to get the AR gen to re-trigger
-  It's a bit simpler, just last note priority nothing complicated
+  was origninally developed for a monotron, this version is general purpose
   */
 
 // inslude the SPI library:
@@ -29,10 +28,11 @@ MIDI_CREATE_DEFAULT_INSTANCE();
 
 #define DAC_BASE -3000 //-3V offset 
 #define DAC_SCALE_PER_SEMITONE 83.333333333
-#define GATE_RETRIGGER_DELAY_US 10000 //time in microseconds to turn gate off in order to retrigger envelope
+#define GATE_RETRIGGER_DELAY_US 100 //time in microseconds to turn gate off in order to retrigger envelope
 
 //MIDI variables
-bool notePlaying = false;
+int currentMidiNote; //the note currently being played
+int keysPressedArray[128] = {0}; //to keep track of which keys are pressed
 
 void setup() {
   //reduce the power a bit
@@ -91,21 +91,52 @@ void setNotePitch(int note) {
   dacWrite(DAC_BASE+(note*DAC_SCALE_PER_SEMITONE)); //set the pitch of the oscillator
 }
 
+
 void HandleNoteOn(byte channel, byte pitch, byte velocity) { 
   // this function is called automatically when a note on message is received 
-  setNotePitch(pitch); //set the oscillator pitch
-  if(notePlaying) {
-    digitalWrite(GATE_PIN,LOW); //turn gate off momentarily to retrigger AR gen
-    delayMicroseconds(GATE_RETRIGGER_DELAY_US);
-  }
-  digitalWrite(GATE_PIN,HIGH); //turn gate on
-  notePlaying = true;
+  keysPressedArray[pitch] = 1;
+  synthNoteOn(pitch);
 }
 
 void handleNoteOff(byte channel, byte pitch, byte velocity)
 {
-  digitalWrite(GATE_PIN,LOW); //turn gate off
-  notePlaying = false;
+  keysPressedArray[pitch] = 0; //update the array holding the keys pressed 
+  if (pitch == currentMidiNote) {
+    //only act if the note released is the one currently playing, otherwise ignore it
+    int highestKeyPressed = findHighestKeyPressed(); //search the array to find the highest key pressed, will return -1 if no keys pressed
+    if (highestKeyPressed != -1) { 
+      //there is another key pressed somewhere, so the note off becomes a note on for the highest note pressed
+      synthNoteOn(highestKeyPressed);
+    }    
+    else  {
+      //there are no other keys pressed so proper note off
+      synthNoteOff();
+    }
+  }  
 }
 
+int findHighestKeyPressed(void) {
+  //search the array to find the highest key pressed. Return -1 if no keys are pressed
+  int highestKeyPressed = -1; 
+  for (int count = 0; count < 127; count++) {
+    //go through the array holding the keys pressed to find which is the highest (highest note has priority), and to find out if no keys are pressed
+    if (keysPressedArray[count] == 1) {
+      highestKeyPressed = count; //find the highest one
+    }
+  }
+  return(highestKeyPressed);
+}
+
+void synthNoteOn(int note) {
+  //starts playback of a note
+  setNotePitch(note); //set the oscillator pitch
+  digitalWrite(GATE_PIN,LOW); //turn gate off momentarily to retrigger LFO
+  delayMicroseconds(GATE_RETRIGGER_DELAY_US); //should not do delays here really but get away with this which seems to be the minimum a montotron needs (may be different for other synths)
+  digitalWrite(GATE_PIN,HIGH); //turn gate on
+  currentMidiNote = note; //store the current note
+}
+
+void synthNoteOff(void) {
+  digitalWrite(GATE_PIN,LOW); //turn gate off
+}
 
