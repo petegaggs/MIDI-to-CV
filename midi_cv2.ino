@@ -1,3 +1,34 @@
+/* 
+  midi_cv
+  MIDI to CV converter
+  control voltage provided by MCP4821 or MCP4822 SPI DAC  
+  uses Arduino MIDI library
+  was origninally developed for a monotron, this version is general purpose
+  OSC_3340_BUILD is for AS3340 based design, which uses 0.504V/Octave instead of the usual 1V
+  
+ * MIT License
+ * Copyright (c) 2023 Peter Gaggs
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.  
+  */
+
+// comment out the line below for use with the original hardware and 1V/Octave
+#define OSC_3340_BUILD
 
 #include <MIDI.h>
 #include <midi_Defs.h>
@@ -5,50 +36,32 @@
 #include <midi_Namespace.h>
 #include <midi_Settings.h>
 
-/*
-  midi_cv
-  MIDI to CV converter
-  control voltage provided by MCP4821 SPI DAC  
-  uses Arduino MIDI library
-  was origninally developed for a monotron, this version is general purpose
-  */
-
 // inslude the SPI library:
 #include <SPI.h>
 //include the midi library:
 MIDI_CREATE_DEFAULT_INSTANCE();
 
-//low power stuff
-#include <avr/power.h>
-#include <avr/sleep.h>
-
 //MIDI_CREATE_DEFAULT_INSTANCE();
 #define GATE_PIN 9 //gate control
+#ifdef OSC_3340_BUILD
+// Settings for new hardware design
+#define SLAVE_SELECT_PIN 7 //spi chip select
+#define MIDI_BASE_NOTE 12 //C0
+#define DAC_SCALE_PER_SEMITONE 42 // 0.504 volts per octave
+#else
+// Settings for old hardware
 #define SLAVE_SELECT_PIN 10 //spi chip select
-
-#define DAC_BASE -3000 //-3V offset 
-#define DAC_SCALE_PER_SEMITONE 83.333333333
-#define GATE_RETRIGGER_DELAY_US 100 //time in microseconds to turn gate off in order to retrigger envelope
+#define MIDI_BASE_NOTE 36 //C2
+#define DAC_SCALE_PER_SEMITONE 83.333333333 // 1 volt per octave
+#endif
 
 //MIDI variables
-int currentMidiNote; //the note currently being played
-int keysPressedArray[128] = {0}; //to keep track of which keys are pressed
+uint8_t currentMidiNote; //the note currently being played
+uint8_t keysPressedArray[128] = {0}; //to keep track of which keys are pressed
+uint16_t midiNoteControl;
+uint16_t midiPitchBendControl = 0; // not implemented yet
 
 void setup() {
-  //reduce the power a bit
-  power_adc_disable();
-  power_timer0_disable();
-  power_timer1_disable();
-  power_timer2_disable();
-  power_twi_disable();
-  //enable pullup resistor on unused pins
-  digitalWrite(2,HIGH);
-  digitalWrite(3,HIGH);
-  digitalWrite(4,HIGH);
-  digitalWrite(5,HIGH);
-  digitalWrite(6,HIGH);
-  digitalWrite(7,HIGH);
-  digitalWrite(8,HIGH);
   //MIDI stuff
   // Initiate MIDI communications, listen to all channels
   MIDI.begin(MIDI_CHANNEL_OMNI);      
@@ -62,8 +75,7 @@ void setup() {
   digitalWrite(SLAVE_SELECT_PIN,HIGH); //set chip select high
   // initialize SPI:
   SPI.begin(); 
-  //Serial.begin(9600); //for debug, can't use midi at the same time!
-  pinMode (GATE_PIN, OUTPUT); //gate for monotron
+  pinMode (GATE_PIN, OUTPUT); //gate output
   digitalWrite(GATE_PIN,LOW); //turn note off
   dacWrite(1000); //set the pitch just for testing
 }
@@ -72,11 +84,8 @@ void loop() {
   MIDI.read();
 }
 
-void dacWrite(int value) {
-  //write a 12 bit number to the MCP8421 DAC
-  if ((value < 0) || (value > 4095)) {
-    value = 0;
-  }
+void dacWrite(uint16_t value) {
+  //write a 12 bit number to the MCP4821/MCP4822 DAC
   // take the SS pin low to select the chip:
   digitalWrite(SLAVE_SELECT_PIN,LOW);
   //send a value to the DAC
@@ -86,19 +95,18 @@ void dacWrite(int value) {
   digitalWrite(SLAVE_SELECT_PIN,HIGH); 
 }
 
-void setNotePitch(int note) {
-  //receive a midi note number and set the DAC voltage accordingly for the pitch CV
-  dacWrite(DAC_BASE+(note*DAC_SCALE_PER_SEMITONE)); //set the pitch of the oscillator
+void updateNotePitch() {
+  // update note pitch, taking into account midi note and midi pitchbend if implemented
+  dacWrite(midiNoteControl + midiPitchBendControl);
 }
 
-
-void HandleNoteOn(byte channel, byte pitch, byte velocity) { 
+void HandleNoteOn(uint8_t channel, uint8_t pitch, uint8_t velocity) { 
   // this function is called automatically when a note on message is received 
   keysPressedArray[pitch] = 1;
   synthNoteOn(pitch);
 }
 
-void handleNoteOff(byte channel, byte pitch, byte velocity)
+void handleNoteOff(uint8_t channel, uint8_t pitch, uint8_t velocity)
 {
   keysPressedArray[pitch] = 0; //update the array holding the keys pressed 
   if (pitch == currentMidiNote) {
@@ -127,11 +135,10 @@ int findHighestKeyPressed(void) {
   return(highestKeyPressed);
 }
 
-void synthNoteOn(int note) {
+void synthNoteOn(uint8_t note) {
   //starts playback of a note
-  setNotePitch(note); //set the oscillator pitch
-  digitalWrite(GATE_PIN,LOW); //turn gate off momentarily to retrigger LFO
-  delayMicroseconds(GATE_RETRIGGER_DELAY_US); //should not do delays here really but get away with this which seems to be the minimum a montotron needs (may be different for other synths)
+  midiNoteControl = (((int16_t) note) - MIDI_BASE_NOTE) * DAC_SCALE_PER_SEMITONE;
+  updateNotePitch();
   digitalWrite(GATE_PIN,HIGH); //turn gate on
   currentMidiNote = note; //store the current note
 }
